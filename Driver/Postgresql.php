@@ -2,31 +2,19 @@
 
 declare(strict_types=1);
 
-/*
- * This file is part of the tenancy/tenancy package.
- *
- * Copyright Tenancy for Laravel
- *
- * For the full copyright and license information, please view the LICENSE
- * file that was distributed with this source code.
- *
- * @see https://tenancy.dev
- * @see https://github.com/tenancy
- */
-
-namespace Tenancy\Database\Drivers\Mysql\Driver;
+namespace Tenancy\Database\Drivers\Postgresql\Driver;
 
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Tenancy\Affects\Connections\Contracts\ResolvesConnections;
-use Tenancy\Database\Drivers\Mysql\Concerns\ManagesSystemConnection;
+use Tenancy\Database\Drivers\Postgresql\Concerns\ManagesSystemConnection;
 use Tenancy\Facades\Tenancy;
 use Tenancy\Hooks\Database\Contracts\ProvidesDatabase;
 use Tenancy\Hooks\Database\Events\Drivers as Events;
 use Tenancy\Identification\Contracts\Tenant;
 
-class Mysql implements ProvidesDatabase
+class Postgresql implements ProvidesDatabase
 {
     public function configure(Tenant $tenant): array
     {
@@ -44,9 +32,9 @@ class Mysql implements ProvidesDatabase
         event(new Events\Creating($tenant, $config, $this));
 
         return $this->processAndDispatch(Events\Created::class, $tenant, [
-            'user'     => "CREATE USER IF NOT EXISTS `{$config['username']}`@'{$config['host']}' IDENTIFIED BY '{$config['password']}'",
-            'database' => "CREATE DATABASE `{$config['database']}`",
-            'grant'    => "GRANT ALL ON `{$config['database']}`.* TO `{$config['username']}`@'{$config['host']}'",
+            'user'     => "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '{$config['username']}') THEN CREATE ROLE \"{$config['username']}\" LOGIN PASSWORD '{$config['password']}'; END IF; END $$;",
+            'database' => "CREATE DATABASE \"{$config['database']}\" OWNER \"{$config['username']}\";",
+            'grant'    => "GRANT ALL PRIVILEGES ON DATABASE \"{$config['database']}\" TO \"{$config['username']}\";",
         ]);
     }
 
@@ -63,18 +51,17 @@ class Mysql implements ProvidesDatabase
         $tableStatements = [];
 
         foreach ($this->retrieveTables($tenant) as $table) {
-            $tableStatements['move-table-'.$table] = "RENAME TABLE `{$config['oldUsername']}`.{$table} TO `{$config['database']}`.{$table}";
+            $tableStatements['move-table-'.$table] = "ALTER TABLE \"{$config['oldUsername']}\".{$table} SET SCHEMA \"{$config['database']}\";";
         }
 
         $statements = array_merge([
-            'user'     => "RENAME USER `{$config['oldUsername']}`@'{$config['host']}' TO `{$config['username']}`@'{$config['host']}'",
-            'password' => "ALTER USER `{$config['username']}`@`{$config['host']}` IDENTIFIED BY '{$config['password']}'",
-            'database' => "CREATE DATABASE `{$config['database']}`",
-            'grant'    => "GRANT ALL ON `{$config['database']}`.* TO `{$config['username']}`@'{$config['host']}'",
+            'user'     => "ALTER ROLE \"{$config['oldUsername']}\" RENAME TO \"{$config['username']}\";",
+            'password' => "ALTER ROLE \"{$config['username']}\" WITH PASSWORD '{$config['password']}';",
+            'database' => "CREATE DATABASE \"{$config['database']}\" OWNER \"{$config['username']}\";",
+            'grant'    => "GRANT ALL PRIVILEGES ON DATABASE \"{$config['database']}\" TO \"{$config['username']}\";",
         ], $tableStatements);
 
-        // Add database drop statement as last statement
-        $statements['delete-db'] = "DROP DATABASE `{$config['oldUsername']}`";
+        $statements['delete-db'] = "DROP DATABASE IF EXISTS \"{$config['oldUsername']}\";";
 
         return $this->processAndDispatch(Events\Updated::class, $tenant, $statements);
     }
@@ -86,8 +73,8 @@ class Mysql implements ProvidesDatabase
         event(new Events\Deleting($tenant, $config, $this));
 
         return $this->processAndDispatch(Events\Deleted::class, $tenant, [
-            'user'     => "DROP USER `{$config['username']}`@'{$config['host']}'",
-            'database' => "DROP DATABASE IF EXISTS `{$config['database']}`",
+            'user'     => "DROP ROLE IF EXISTS \"{$config['username']}\";",
+            'database' => "DROP DATABASE IF EXISTS \"{$config['database']}\";",
         ]);
     }
 
@@ -111,10 +98,8 @@ class Mysql implements ProvidesDatabase
         foreach ($statements as $statement) {
             try {
                 $success = $this->system($tenant)->statement($statement);
-                // @codeCoverageIgnoreStart
             } catch (QueryException $e) {
                 $this->system($tenant)->rollBack();
-                // @codeCoverageIgnoreEnd
             } finally {
                 if (!$success) {
                     throw $e;
@@ -127,11 +112,6 @@ class Mysql implements ProvidesDatabase
         return $success;
     }
 
-    /**
-     * @param Tenant $tenant
-     *
-     * @return array
-     */
     protected function retrieveTables(Tenant $tenant): array
     {
         $tempTenant = $tenant->replicate();
@@ -148,15 +128,6 @@ class Mysql implements ProvidesDatabase
         return $tables;
     }
 
-    /**
-     * Processes the provided statements and dispatches an event.
-     *
-     * @param string $event
-     * @param Tenant $tenant
-     * @param array  $statements
-     *
-     * @return bool
-     */
     private function processAndDispatch(string $event, Tenant $tenant, array $statements)
     {
         $result = $this->process($tenant, $statements);

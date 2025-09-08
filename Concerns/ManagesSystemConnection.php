@@ -14,7 +14,7 @@ declare(strict_types=1);
  * @see https://github.com/tenancy
  */
 
-namespace Tenancy\Database\Drivers\Mysql\Concerns;
+namespace Tenancy\Database\Drivers\Concerns;
 
 interface ManagesSystemConnection
 {
